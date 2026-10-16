@@ -10,3 +10,4 @@ langchain-neo4j
 langchain-text-splitters
 chromadb
 rank-bm25
+sentence-transformers

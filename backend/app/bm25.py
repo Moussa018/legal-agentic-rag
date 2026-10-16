@@ -8,6 +8,8 @@ import unicodedata
 
 from rank_bm25 import BM25Okapi
 
+from . import config
+from .rerank import rerank
 from .stores import get_collection
 
 _index: dict = {"count": -1, "bm25": None, "ids": [], "docs": [], "metas": []}
@@ -57,12 +59,20 @@ def vector_hits(query: str, k: int) -> list[dict]:
 
 
 def fused_search(query: str, k: int = 5, pool: int = 20, rrf_k: int = 60) -> list[dict]:
-    """Reciprocal Rank Fusion of vector and BM25 rankings."""
+    """Two-stage retrieval.
+
+    Stage 1: Reciprocal Rank Fusion of vector and BM25 rankings -> a wide shortlist.
+    Stage 2: cross-encoder rerank of that shortlist -> the final k (skipped if RERANK_ENABLED=false).
+    """
     scores: dict[str, float] = {}
     by_id: dict[str, dict] = {}
     for hits in (vector_hits(query, pool), bm25_search(query, pool)):
         for rank, h in enumerate(hits):
             scores[h["id"]] = scores.get(h["id"], 0.0) + 1.0 / (rrf_k + rank + 1)
             by_id[h["id"]] = h
-    best = sorted(scores, key=scores.get, reverse=True)[:k]
-    return [by_id[i] for i in best]
+    shortlist = max(k, config.RERANK_CANDIDATES) if config.RERANK_ENABLED else k
+    best = sorted(scores, key=scores.get, reverse=True)[:shortlist]
+    candidates = [by_id[i] for i in best]
+    if config.RERANK_ENABLED:
+        return rerank(query, candidates, k)
+    return candidates
