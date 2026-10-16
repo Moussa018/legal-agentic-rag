@@ -1,0 +1,12 @@
+[
+  {
+    "question": "Quelles sociétés sont liées à ACME par un contrat expirant en 2026 ?",
+    "expected": ["Beta SARL", "Gamma SA"],
+    "hops": 2
+  },
+  {
+    "question": "Quelles clauses des contrats signés par un représentant de ACME font référence au RGPD ?",
+    "expected": ["Clause 7"],
+    "hops": 3
+  }
+]
