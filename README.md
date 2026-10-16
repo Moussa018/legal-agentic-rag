@@ -1,129 +1,133 @@
-# legal-agentic-rag
+# Legal Agentic RAG
 
-RAG agentique sur documents juridiques (contrats, lois) : les PDF sont transformés en **graphe de connaissances Neo4j** et en **vecteurs Chroma**, puis interrogés par un agent (Claude) qui combine recherche documentaire et requêtes Cypher pour répondre aux questions **multi-sauts**.
+Question answering over legal PDFs (contracts, statutes) that combines **vector + keyword search** with a **Neo4j knowledge graph**, driven by an **LLM agent** that picks its own tools.
 
-## Fonctionnalités
+Plain vector RAG finds passages that *look like* the question, but misses answers that require following relationships, e.g. *"Which companies are linked to ACME by a contract expiring in 2026?"* (company → contract → date). This project extracts entities and relations into a graph so those multi-hop questions can be answered with Cypher, while hybrid text retrieval handles citations and exact terms.
 
-- Ingestion de PDF : découpage en chunks, embeddings (Chroma) et extraction d'entités/relations par LLM (`LLMGraphTransformer` + Claude) vers Neo4j.
-- Schéma de graphe fermé : `Personne`, `Societe`, `Contrat`, `Clause`, `Date`, `Loi`.
-- Trois modes de question-réponse : `vector`, `hybrid`, `agentic`.
-- Recherche hybride : vecteurs + BM25 fusionnés par RRF (Reciprocal Rank Fusion).
-- Agent à outils qui corrige ses propres erreurs Cypher et renvoie la trace de ses appels.
-- Banc d'évaluation multi-sauts (vector vs hybrid vs agentic).
-
-## Architecture
+## How it works
 
 ```
-PDF ─► chunks ─┬─► Chroma (embeddings)
-               └─► LLMGraphTransformer (Claude) ─► Neo4j
+Ingestion (once)
+  PDF ─► chunks ─┬─► Chroma (embeddings) ─► also indexed by BM25
+                 └─► LLMGraphTransformer (Claude) ─► Neo4j (closed schema)
 
-/ask ─► top-k chunks (Chroma) + Cypher généré (Neo4j) ─► Claude ─► réponse + sources
+Question (each call)
+  POST /ask ─► mode ─► retrieval (Chroma + BM25) and/or Cypher (Neo4j) ─► Claude ─► answer + sources
 ```
 
-### Modes de réponse
+### Three answer modes
 
-| Mode | Fonctionnement |
-|---|---|
-| `vector` | Top-k Chroma uniquement (baseline). |
-| `hybrid` | Pipeline fixe : récupération vecteur + BM25 fusionnée par RRF (`app/bm25.py`), plus une requête Cypher générée. |
-| `agentic` (défaut) | Boucle d'outils (`app/agent.py`), jusqu'à 8 étapes. Outils : `get_graph_schema`, `run_cypher`, `keyword_search` (BM25), `semantic_search` (vecteur), `search_documents` (fusionné). Corrige ses erreurs Cypher et renvoie la trace des appels dans `steps`. |
+| Mode | What it does | Use it for |
+| --- | --- | --- |
+| `vector` | Top-k dense retrieval from Chroma only | Baseline |
+| `hybrid` | Vector + BM25 fused with Reciprocal Rank Fusion, plus one LLM-generated Cypher query, in a single prompt | Predictable cost and latency |
+| `agentic` (default) | Claude loops over tools for up to 8 steps, retries failed Cypher, refines searches, returns its trace in `steps` | Multi-hop questions |
 
-## Structure du projet
+### Agent tools
+
+| Tool | When the agent uses it |
+| --- | --- |
+| `get_graph_schema` | First step for relationship questions |
+| `run_cypher` | Query the graph (read-only; errors are returned so the agent can fix its query) |
+| `search_documents` | Default: vector + BM25 fused |
+| `keyword_search` | Exact terms: clause numbers, names, statute references, amounts |
+| `semantic_search` | Concepts without precise vocabulary |
+
+### Graph schema
+
+The schema is closed so the graph stays consistent across documents.
+
+- Nodes: `Personne`, `Societe`, `Contrat`, `Clause`, `Date`, `Loi`
+- Relations: `PARTIE_A`, `REPRESENTE`, `CONTIENT`, `EXPIRE_LE`, `SIGNE_LE`, `REFERENCE`, `FILIALE_DE`
+
+See `backend/app/config.py` for the exact (source, relation, target) triples.
+
+## Tech stack
+
+FastAPI · Claude (via `langchain-anthropic`) · ChromaDB · `rank-bm25` · Neo4j 5.26 + APOC · LangChain · `pypdf`
+
+## Project layout
 
 ```
-legal-agentic-rag/
-├── docker-compose.yml        # Neo4j
-├── .env.example
-├── data/pdfs/                # PDF à ingérer
-└── backend/
-    ├── app/
-    │   ├── config.py         # configuration et schéma fermé du graphe
-    │   ├── ingest.py         # pipeline d'ingestion
-    │   ├── qa.py             # modes vector et hybrid
-    │   ├── bm25.py           # recherche BM25 et fusion RRF
-    │   ├── agent.py          # mode agentic (boucle d'outils)
-    │   └── main.py           # API FastAPI
-    ├── eval/                 # benchmark multi-sauts
-    └── requirements.txt
+backend/
+  app/
+    config.py     env vars and closed graph schema
+    stores.py     factories for the LLM, Neo4j and Chroma
+    ingest.py     PDF -> Chroma + Neo4j
+    bm25.py       BM25 index, vector hits, RRF fusion
+    qa.py         vector and hybrid modes, prompts, read-only guard
+    agent.py      agentic mode (tool loop)
+    main.py       FastAPI app
+  eval/
+    run_eval.py   compares the three modes
+    questions.json
+data/pdfs/        drop your PDFs here
+docker-compose.yml
+.env.example
 ```
 
-## Prérequis
+## Getting started
 
-- Python 3.10+
-- Docker et Docker Compose
-- Une clé API Anthropic
-
-## Installation
+**Prerequisites:** Python 3.10+, Docker, an Anthropic API key.
 
 ```bash
-git clone https://github.com/Moussa018/legal-agentic-rag.git
-cd legal-agentic-rag
-
-cp .env.example .env          # puis renseigner ANTHROPIC_API_KEY
-docker compose up -d          # démarre Neo4j (interface : http://localhost:7474)
+cp .env.example .env          # set ANTHROPIC_API_KEY
+docker compose up -d          # Neo4j, browser at http://localhost:7474
 
 cd backend
 python -m venv .venv
-```
-
-Activer l'environnement virtuel :
-
-```bash
-# Windows (PowerShell)
-.venv\Scripts\activate
-
-# Linux / macOS
-source .venv/bin/activate
-```
-
-Puis installer les dépendances :
-
-```bash
+source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+
+# put PDFs in data/pdfs/
+python -m app.ingest
+uvicorn app.main:app --reload
 ```
 
-## Utilisation
+### Configuration
 
-1. Déposer les PDF dans `data/pdfs/`.
-2. Lancer l'ingestion :
+| Variable | Default |
+| --- | --- |
+| `ANTHROPIC_API_KEY` | required |
+| `LLM_MODEL` | `claude-sonnet-5-5` |
+| `NEO4J_URI` | `bolt://localhost:7687` |
+| `NEO4J_USER` / `NEO4J_PASSWORD` | `neo4j` / `changeme123` |
+| `CHROMA_DIR` | `./data/chroma` |
+| `PDF_DIR` | `./data/pdfs` |
 
-   ```bash
-   python -m app.ingest
-   ```
+Change the default Neo4j password before exposing anything beyond localhost.
 
-3. Démarrer l'API :
+## API
 
-   ```bash
-   uvicorn app.main:app --reload
-   ```
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Which companies are linked to ACME by a contract expiring in 2026?", "mode": "agentic"}'
+```
 
-4. Poser une question :
+- `POST /ask` with `{"question": str, "mode": "agentic" | "hybrid" | "vector"}` (default `agentic`)
+- `GET /health` returns `{"status": "ok"}`
 
-   ```bash
-   curl -X POST http://localhost:8000/ask \
-     -H "Content-Type: application/json" \
-     -d '{"question": "Quelles clauses du contrat avec ACME SA sont soumises à la loi X ?", "mode": "agentic"}'
-   ```
+Responses include `answer` and `mode`. `hybrid` and `vector` add `cypher`, `graph_rows` and `sources` (file, page); `agentic` adds `steps` (tool, args, truncated result) and `truncated: true` if it ran out of steps.
 
-   Le champ `mode` accepte `agentic` (défaut), `hybrid` ou `vector`. La réponse contient le texte généré, les sources et, en mode agentic, la trace des appels d'outils (`steps`).
+## Evaluation
 
-5. Lancer l'évaluation :
+```bash
+cd backend
+python -m eval.run_eval
+```
 
-   ```bash
-   python -m eval.run_eval
-   ```
+Runs every question in `eval/questions.json` through all three modes and prints a score per mode. A question passes when every expected string appears in the answer (case-insensitive). The bundled file holds only two sample questions: replace it with questions and gold answers from your own corpus before trusting the numbers.
 
-## Variables d'environnement
+## Known limitations and roadmap
 
-Voir `.env.example`. La variable indispensable est `ANTHROPIC_API_KEY`. Les identifiants Neo4j doivent correspondre à ceux définis dans `docker-compose.yml`.
+- [ ] Run generated Cypher with a read-only Neo4j account. Today only a keyword filter blocks writes, and it also rejects legitimate `SET`/`CALL`.
+- [ ] Entity normalization and deduplication (e.g. "ACME SA" vs "Acme").
+- [ ] A real evaluation set: 30+ multi-hop questions with reference answers.
+- [ ] Skip already-ingested PDFs; re-running ingestion repeats LLM extraction for every file.
+- [ ] Frontend (React): question box, answer, sources, displayed Cypher. CORS is already open for `http://localhost:5173`.
+- [ ] Cost control for extraction (one LLM call per chunk): caching or a smaller model.
 
-## Feuille de route
+## Disclaimer
 
-- [ ] Frontend React : champ de question, réponse, sources, Cypher affiché.
-- [ ] Jeu d'évaluation réel : 30+ questions multi-sauts avec réponses de référence.
-- [ ] Normalisation et dédoublonnage d'entités (ex. « ACME SA » vs « Acme »).
-- [ ] Compte Neo4j en lecture seule pour exécuter le Cypher généré (le filtre de mots-clés dans `qa.py` n'est qu'un garde-fou).
-
-## Avertissement
-
-Ce projet est un outil d'aide à la recherche documentaire. Il ne constitue pas un avis juridique.
+This is a research and portfolio project. Its answers are not legal advice.
